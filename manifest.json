@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Kick VOD Seek Fix",
+  "version": "1.0.0",
+  "description": "Fixes Kick VOD progress bar clicks by forcing seek-bar clicks to jump reliably, even near the current handle position.",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://kick.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
