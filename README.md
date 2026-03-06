@@ -9,7 +9,7 @@ When Kick ignores a click near the current seek handle, this extension intercept
 1. Open `chrome://extensions`.
 2. Enable `Developer mode`.
 3. Click `Load unpacked`.
-4. Select this folder: `H:\Projects\kick-player-jump-extension`
+4. Select this folder: `\kick-player-jump-extension`
 
 ## What it does
 
