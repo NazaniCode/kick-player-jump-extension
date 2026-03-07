@@ -147,6 +147,15 @@
     return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
   }
 
+  function isDirectVideoClick(event, video) {
+    if (!(video instanceof HTMLVideoElement)) {
+      return false;
+    }
+
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    return path.includes(video);
+  }
+
   function seekVideoFromClick(event) {
     if (!isKickVodPage()) {
       return;
@@ -208,7 +217,11 @@
       return;
     }
 
-    if (!isPointInsideRect(event.clientX, event.clientY, videoRect) || video.paused) {
+    if (
+      !isPointInsideRect(event.clientX, event.clientY, videoRect) ||
+      video.paused ||
+      !isDirectVideoClick(event, video)
+    ) {
       return;
     }
 
