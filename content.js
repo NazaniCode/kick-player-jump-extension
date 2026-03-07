@@ -143,6 +143,10 @@
     return Math.min(Math.max(value, min), max);
   }
 
+  function isPointInsideRect(x, y, rect) {
+    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+  }
+
   function seekVideoFromClick(event) {
     if (!isKickVodPage()) {
       return;
@@ -166,43 +170,52 @@
       return;
     }
 
+    const videoRect = video.getBoundingClientRect();
     const seekBar = findSeekBar(event, video);
-    if (!seekBar) {
+    if (seekBar) {
+      const rect = seekBar.getBoundingClientRect();
+      if (rect.width <= 0 || !Number.isFinite(video.duration) || video.duration <= 0) {
+        return;
+      }
+
+      const percent = clamp((event.clientX - rect.left) / rect.width, 0, 1);
+      const targetTime = percent * video.duration;
+
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      event.stopPropagation();
+
+      if (typeof video.fastSeek === "function") {
+        video.fastSeek(targetTime);
+      } else {
+        video.currentTime = targetTime;
+      }
+
+      // Some player UIs watch bubbling events around the timeline to refresh the scrubber.
+      seekBar.dispatchEvent(
+        new PointerEvent("pointermove", {
+          bubbles: true,
+          cancelable: true,
+          clientX: event.clientX,
+          clientY: rect.top + rect.height / 2,
+          pointerId: 1,
+          pointerType: "mouse",
+          isPrimary: true
+        })
+      );
+      seekBar.dispatchEvent(new Event("input", { bubbles: true }));
+      seekBar.dispatchEvent(new Event("change", { bubbles: true }));
       return;
     }
 
-    const rect = seekBar.getBoundingClientRect();
-    if (rect.width <= 0 || !Number.isFinite(video.duration) || video.duration <= 0) {
+    if (!isPointInsideRect(event.clientX, event.clientY, videoRect) || video.paused) {
       return;
     }
-
-    const percent = clamp((event.clientX - rect.left) / rect.width, 0, 1);
-    const targetTime = percent * video.duration;
 
     event.preventDefault();
     event.stopImmediatePropagation();
     event.stopPropagation();
-
-    if (typeof video.fastSeek === "function") {
-      video.fastSeek(targetTime);
-    } else {
-      video.currentTime = targetTime;
-    }
-
-    // Some player UIs watch bubbling events around the timeline to refresh the scrubber.
-    seekBar.dispatchEvent(
-      new PointerEvent("pointermove", {
-        bubbles: true,
-        cancelable: true,
-        clientX: event.clientX,
-        clientY: rect.top + rect.height / 2,
-        pointerId: 1,
-        pointerType: "mouse",
-        isPrimary: true
-      })
-    );
-    seekBar.dispatchEvent(new Event("input", { bubbles: true }));
-    seekBar.dispatchEvent(new Event("change", { bubbles: true }));
+    video.pause();
   }
 
   document.addEventListener("click", seekVideoFromClick, true);
