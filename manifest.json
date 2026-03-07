@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Kick VOD Seek Fix",
-  "version": "1.0.0",
-  "description": "Fixes Kick VOD timeline clicks by making seek jumps reliable and allowing click-to-pause inside the player.",
+  "version": "1.1.0",
+  "description": "Fixes Kick VOD seeking, restores click-to-pause, and replaces the round scrubber with a vertical line handle.",
   "content_scripts": [
     {
       "matches": [
