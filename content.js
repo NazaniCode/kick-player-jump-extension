@@ -7,6 +7,7 @@
   const CUSTOM_OVERLAY_CLASS = "kick-vod-seek-fix-overlay";
   const CUSTOM_OVERLAY_TRACK_CLASS = "kick-vod-seek-fix-overlay-track";
   const CUSTOM_OVERLAY_FILL_CLASS = "kick-vod-seek-fix-overlay-fill";
+  const OVERLAY_HOST_ATTR = "data-kick-vod-seek-fix-overlay-host";
   const RESUME_PROMPT_OVERLAY_CLASS = "kick-vod-seek-fix-resume-overlay";
   const RESUME_PROMPT_PANEL_CLASS = "kick-vod-seek-fix-resume-panel";
   const RESUME_PROMPT_TITLE_CLASS = "kick-vod-seek-fix-resume-title";
@@ -99,13 +100,13 @@
       }
 
       .${CUSTOM_OVERLAY_CLASS} {
-        position: fixed;
+        position: absolute;
         left: 0;
         top: 0;
         width: 0;
         height: 0;
         pointer-events: none;
-        z-index: 2147483646;
+        z-index: 1;
       }
 
       .${CUSTOM_OVERLAY_TRACK_CLASS},
@@ -363,21 +364,50 @@
     return typeof chrome !== "undefined" && Boolean(chrome.storage?.local);
   }
 
+  function getRuntimeErrorMessage(error) {
+    if (!error) {
+      return "";
+    }
+
+    if (typeof error === "string") {
+      return error;
+    }
+
+    if (typeof error.message === "string") {
+      return error.message;
+    }
+
+    return String(error);
+  }
+
+  function isContextInvalidatedError(error) {
+    return /Extension context invalidated/i.test(getRuntimeErrorMessage(error));
+  }
+
   function storageLocalGet(key) {
     if (!isStorageAvailable()) {
       return Promise.resolve({});
     }
 
     return new Promise((resolve) => {
-      chrome.storage.local.get(key, (result) => {
-        if (chrome.runtime?.lastError) {
-          console.warn("Kick VOD Seek Fix: failed to read resume entries.", chrome.runtime.lastError);
-          resolve({});
-          return;
-        }
+      try {
+        chrome.storage.local.get(key, (result) => {
+          if (chrome.runtime?.lastError) {
+            if (!isContextInvalidatedError(chrome.runtime.lastError)) {
+              console.warn("Kick VOD Seek Fix: failed to read resume entries.", chrome.runtime.lastError);
+            }
+            resolve({});
+            return;
+          }
 
-        resolve(result || {});
-      });
+          resolve(result || {});
+        });
+      } catch (error) {
+        if (!isContextInvalidatedError(error)) {
+          console.warn("Kick VOD Seek Fix: failed to read resume entries.", error);
+        }
+        resolve({});
+      }
     });
   }
 
@@ -387,13 +417,20 @@
     }
 
     return new Promise((resolve) => {
-      chrome.storage.local.set(value, () => {
-        if (chrome.runtime?.lastError) {
-          console.warn("Kick VOD Seek Fix: failed to save resume entries.", chrome.runtime.lastError);
-        }
+      try {
+        chrome.storage.local.set(value, () => {
+          if (chrome.runtime?.lastError && !isContextInvalidatedError(chrome.runtime.lastError)) {
+            console.warn("Kick VOD Seek Fix: failed to save resume entries.", chrome.runtime.lastError);
+          }
 
+          resolve();
+        });
+      } catch (error) {
+        if (!isContextInvalidatedError(error)) {
+          console.warn("Kick VOD Seek Fix: failed to save resume entries.", error);
+        }
         resolve();
-      });
+      }
     });
   }
 
@@ -452,7 +489,9 @@
         return nextEntries;
       })
       .catch((error) => {
-        console.warn("Kick VOD Seek Fix: resume storage update failed.", error);
+        if (!isContextInvalidatedError(error)) {
+          console.warn("Kick VOD Seek Fix: resume storage update failed.", error);
+        }
         return resumeEntriesCache || [];
       });
 
@@ -607,6 +646,75 @@
     return bestRoot || document.body;
   }
 
+  function scoreSliderTrackCandidate(element, sliderRect, videoRect) {
+    if (!(element instanceof HTMLElement) || element.classList.contains(CUSTOM_OVERLAY_CLASS)) {
+      return -1;
+    }
+
+    const rect = element.getBoundingClientRect();
+    if (
+      rect.width < Math.max(80, videoRect.width * 0.18) ||
+      rect.height <= 0 ||
+      rect.height > 14 ||
+      rect.left < sliderRect.left - 12 ||
+      rect.right > sliderRect.right + 12 ||
+      rect.bottom < videoRect.bottom - 70 ||
+      rect.top > videoRect.bottom + 18
+    ) {
+      return -1;
+    }
+
+    const style = window.getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+      return -1;
+    }
+
+    let score = 0;
+    const centerY = rect.top + rect.height / 2;
+    const targetY = videoRect.bottom - 18;
+
+    score += Math.max(0, 18 - Math.abs(centerY - targetY));
+    score += rect.width / Math.max(1, sliderRect.width);
+    score += Math.max(0, 14 - rect.height);
+
+    if (element.getAttribute("role") === "progressbar" || element.getAttribute("role") === "slider") {
+      score += 8;
+    }
+
+    if (isGreenishColor(style.backgroundColor) || isGreenishColor(style.borderColor)) {
+      score += 4;
+    }
+
+    return score;
+  }
+
+  function getSliderTrackRect(slider, video) {
+    if (!(slider instanceof HTMLElement)) {
+      return null;
+    }
+
+    const sliderRect = slider.getBoundingClientRect();
+    if (sliderRect.width <= 0 || sliderRect.height <= 0) {
+      return null;
+    }
+
+    const videoRect = video.getBoundingClientRect();
+    const candidates = getNearbySliderNodes(slider);
+
+    let bestRect = null;
+    let bestScore = -1;
+
+    for (const node of candidates) {
+      const score = scoreSliderTrackCandidate(node, sliderRect, videoRect);
+      if (score > bestScore) {
+        bestScore = score;
+        bestRect = node.getBoundingClientRect();
+      }
+    }
+
+    return bestScore >= 10 ? bestRect : null;
+  }
+
   function scoreTimelineBandCandidate(element, videoRect) {
     if (!(element instanceof HTMLElement) || element.classList.contains(CUSTOM_OVERLAY_CLASS)) {
       return -1;
@@ -653,11 +761,9 @@
   }
 
   function getTimelineRect(video, slider) {
-    if (slider instanceof HTMLElement) {
-      const rect = slider.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) {
-        return rect;
-      }
+    const sliderTrackRect = slider instanceof HTMLElement ? getSliderTrackRect(slider, video) : null;
+    if (sliderTrackRect) {
+      return sliderTrackRect;
     }
 
     const videoRect = video.getBoundingClientRect();
@@ -675,7 +781,18 @@
       }
     }
 
-    return bestScore >= 8 ? bestRect : null;
+    if (bestScore >= 8) {
+      return bestRect;
+    }
+
+    if (slider instanceof HTMLElement) {
+      const rect = slider.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        return rect;
+      }
+    }
+
+    return null;
   }
 
   function isTimelinePiece(element, timelineRect) {
@@ -732,7 +849,25 @@
     }
   }
 
-  function ensureOverlayParts() {
+  function ensureOverlayHost(playerRoot) {
+    if (!(playerRoot instanceof HTMLElement)) {
+      return null;
+    }
+
+    playerRoot.setAttribute(OVERLAY_HOST_ATTR, "true");
+    if (window.getComputedStyle(playerRoot).position === "static") {
+      playerRoot.style.position = "relative";
+    }
+
+    return playerRoot;
+  }
+
+  function ensureOverlayParts(playerRoot) {
+    const overlayHost = ensureOverlayHost(playerRoot);
+    if (!(overlayHost instanceof HTMLElement)) {
+      return null;
+    }
+
     let overlay = document.querySelector(`.${CUSTOM_OVERLAY_CLASS}`);
     if (!(overlay instanceof HTMLElement)) {
       overlay = document.createElement("div");
@@ -748,7 +883,9 @@
       handle.className = CUSTOM_HANDLE_CLASS;
 
       overlay.append(track, fill, handle);
-      document.body.appendChild(overlay);
+      overlayHost.appendChild(overlay);
+    } else if (overlay.parentElement !== overlayHost) {
+      overlayHost.appendChild(overlay);
     }
 
     const track = overlay.querySelector(`.${CUSTOM_OVERLAY_TRACK_CLASS}`);
@@ -986,11 +1123,12 @@
     }
 
     ensureHandleStyle();
+    const playerRoot = getPlayerSearchRoot(video);
 
     const progressPercent = slider instanceof HTMLElement
       ? getSliderProgressPercent(slider, video)
       : clamp(video.currentTime / Math.max(video.duration || 1, 1), 0, 1);
-    const overlayParts = ensureOverlayParts();
+    const overlayParts = ensureOverlayParts(playerRoot);
     if (!overlayParts) {
       syncResumePromptPosition();
       return;
@@ -1012,10 +1150,11 @@
     );
     const fillWidth = clamp(handleLeft, 0, timelineRect.width);
     const handleHeight = Math.max(CUSTOM_HANDLE_MIN_HEIGHT, timelineRect.height + 10);
+    const playerRect = playerRoot.getBoundingClientRect();
 
     overlayParts.overlay.style.display = "block";
-    overlayParts.overlay.style.left = `${timelineRect.left}px`;
-    overlayParts.overlay.style.top = `${timelineRect.top}px`;
+    overlayParts.overlay.style.left = `${timelineRect.left - playerRect.left}px`;
+    overlayParts.overlay.style.top = `${timelineRect.top - playerRect.top}px`;
     overlayParts.overlay.style.width = `${timelineRect.width}px`;
     overlayParts.overlay.style.height = `${timelineRect.height}px`;
     overlayParts.fill.style.width = `${fillWidth}px`;
