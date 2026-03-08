@@ -7,7 +7,14 @@
   const CUSTOM_OVERLAY_CLASS = "kick-vod-seek-fix-overlay";
   const CUSTOM_OVERLAY_TRACK_CLASS = "kick-vod-seek-fix-overlay-track";
   const CUSTOM_OVERLAY_FILL_CLASS = "kick-vod-seek-fix-overlay-fill";
-  const HIDDEN_HANDLE_CLASS = "kick-vod-seek-fix-hidden-handle";
+  const RESUME_PROMPT_OVERLAY_CLASS = "kick-vod-seek-fix-resume-overlay";
+  const RESUME_PROMPT_PANEL_CLASS = "kick-vod-seek-fix-resume-panel";
+  const RESUME_PROMPT_TITLE_CLASS = "kick-vod-seek-fix-resume-title";
+  const RESUME_PROMPT_TEXT_CLASS = "kick-vod-seek-fix-resume-text";
+  const RESUME_PROMPT_BUTTON_ROW_CLASS = "kick-vod-seek-fix-resume-actions";
+  const RESUME_PROMPT_BUTTON_CLASS = "kick-vod-seek-fix-resume-button";
+  const RESUME_PROMPT_PRIMARY_BUTTON_CLASS = "kick-vod-seek-fix-resume-button-primary";
+  const RESUME_PROMPT_SECONDARY_BUTTON_CLASS = "kick-vod-seek-fix-resume-button-secondary";
   const HIDDEN_SLIDER_ATTR = "data-kick-vod-seek-fix-hidden";
   const HIDDEN_TIMELINE_ATTR = "data-kick-vod-seek-fix-hidden-timeline";
   const RANGE_SLIDER_ATTR = "data-kick-vod-seek-fix-range";
@@ -16,6 +23,12 @@
   const CUSTOM_TRACK_HEIGHT = 4;
   const FALLBACK_HANDLE_OFFSET = 2;
   const RANGE_HANDLE_SHIFT = -8;
+  const RESUME_STORAGE_KEY = "kickVodResumeEntries";
+  const MAX_RESUME_ENTRIES = 50;
+  const RESUME_SAVE_INTERVAL_MS = 10_000;
+  const SESSION_CHECK_INTERVAL_MS = 1_000;
+  const MIN_RESUME_PROMPT_SECONDS = 5;
+  const LOCATION_CHANGE_EVENT = "kick-vod-seek-fix-locationchange";
   const EXCLUDED_SELECTOR = [
     "button",
     "a",
@@ -27,8 +40,26 @@
     "[contenteditable='true']"
   ].join(",");
 
+  let resumeEntriesCache = null;
+  let resumeEntriesLoadPromise = null;
+  let resumeStorageWriteQueue = Promise.resolve();
+  let activeVodKey = null;
+  let activeVideo = null;
+  let activeSessionToken = 0;
+  let activeSessionInitialized = false;
+  let resumePromptState = null;
+  let seekHandleUpdateQueued = false;
+
   function isKickVodPage() {
     return /\/videos\/[^/]+/.test(window.location.pathname);
+  }
+
+  function getCurrentVodKey() {
+    if (!isKickVodPage()) {
+      return null;
+    }
+
+    return window.location.pathname.replace(/\/+$/, "");
   }
 
   function getVisibleVideo() {
@@ -37,12 +68,7 @@
     return videos
       .filter((video) => {
         const rect = video.getBoundingClientRect();
-        return (
-          rect.width > 0 &&
-          rect.height > 0 &&
-          Number.isFinite(video.duration) &&
-          video.duration > 0
-        );
+        return rect.width > 0 && rect.height > 0;
       })
       .sort((left, right) => {
         const leftRect = left.getBoundingClientRect();
@@ -102,10 +128,6 @@
         background: #23c552;
       }
 
-      .${HIDDEN_HANDLE_CLASS} {
-        opacity: 0 !important;
-      }
-
       [${HIDDEN_SLIDER_ATTR}] {
         opacity: 0 !important;
       }
@@ -139,6 +161,79 @@
         background: #23c552;
         box-shadow: 0 0 0 1px rgba(35, 197, 82, 0.15);
         transform: translateX(${RANGE_HANDLE_SHIFT}px);
+      }
+
+      .${RESUME_PROMPT_OVERLAY_CLASS} {
+        position: fixed;
+        left: 0;
+        top: 0;
+        width: 0;
+        height: 0;
+        display: none;
+        align-items: flex-end;
+        justify-content: center;
+        padding: 24px;
+        box-sizing: border-box;
+        pointer-events: none;
+        z-index: 2147483647;
+      }
+
+      .${RESUME_PROMPT_PANEL_CLASS} {
+        width: min(420px, 100%);
+        padding: 18px 20px;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        border-radius: 14px;
+        background: rgba(8, 12, 18, 0.9);
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+        backdrop-filter: blur(12px);
+        color: #f8fafc;
+        pointer-events: auto;
+      }
+
+      .${RESUME_PROMPT_TITLE_CLASS} {
+        margin: 0 0 6px;
+        font-size: 18px;
+        font-weight: 700;
+        line-height: 1.35;
+      }
+
+      .${RESUME_PROMPT_TEXT_CLASS} {
+        margin: 0;
+        font-size: 14px;
+        line-height: 1.5;
+        color: rgba(248, 250, 252, 0.82);
+      }
+
+      .${RESUME_PROMPT_BUTTON_ROW_CLASS} {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 16px;
+      }
+
+      .${RESUME_PROMPT_BUTTON_CLASS} {
+        border: 0;
+        border-radius: 999px;
+        padding: 10px 14px;
+        font: inherit;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: transform 120ms ease, opacity 120ms ease, background-color 120ms ease;
+      }
+
+      .${RESUME_PROMPT_BUTTON_CLASS}:hover {
+        transform: translateY(-1px);
+      }
+
+      .${RESUME_PROMPT_PRIMARY_BUTTON_CLASS} {
+        background: #23c552;
+        color: #04130a;
+      }
+
+      .${RESUME_PROMPT_SECONDARY_BUTTON_CLASS} {
+        background: rgba(255, 255, 255, 0.12);
+        color: #f8fafc;
       }
     `;
 
@@ -249,6 +344,138 @@
 
   function clamp(value, min, max) {
     return Math.min(Math.max(value, min), max);
+  }
+
+  function formatTimecode(totalSeconds) {
+    const safeSeconds = Math.max(0, Math.floor(totalSeconds));
+    const hours = Math.floor(safeSeconds / 3600);
+    const minutes = Math.floor((safeSeconds % 3600) / 60);
+    const seconds = safeSeconds % 60;
+
+    if (hours > 0) {
+      return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+    }
+
+    return `${minutes}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  function isStorageAvailable() {
+    return typeof chrome !== "undefined" && Boolean(chrome.storage?.local);
+  }
+
+  function storageLocalGet(key) {
+    if (!isStorageAvailable()) {
+      return Promise.resolve({});
+    }
+
+    return new Promise((resolve) => {
+      chrome.storage.local.get(key, (result) => {
+        if (chrome.runtime?.lastError) {
+          console.warn("Kick VOD Seek Fix: failed to read resume entries.", chrome.runtime.lastError);
+          resolve({});
+          return;
+        }
+
+        resolve(result || {});
+      });
+    });
+  }
+
+  function storageLocalSet(value) {
+    if (!isStorageAvailable()) {
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve) => {
+      chrome.storage.local.set(value, () => {
+        if (chrome.runtime?.lastError) {
+          console.warn("Kick VOD Seek Fix: failed to save resume entries.", chrome.runtime.lastError);
+        }
+
+        resolve();
+      });
+    });
+  }
+
+  function normalizeResumeEntries(entries) {
+    if (!Array.isArray(entries)) {
+      return [];
+    }
+
+    const uniqueEntries = new Map();
+
+    for (const entry of [...entries].sort((left, right) => right.updatedAt - left.updatedAt)) {
+      if (!entry || typeof entry.vodKey !== "string") {
+        continue;
+      }
+
+      const resumeTime = Math.max(0, Math.floor(Number(entry.resumeTime) || 0));
+      const updatedAt = Number(entry.updatedAt);
+      if (!Number.isFinite(updatedAt)) {
+        continue;
+      }
+
+      if (!uniqueEntries.has(entry.vodKey)) {
+        uniqueEntries.set(entry.vodKey, {
+          vodKey: entry.vodKey,
+          resumeTime,
+          updatedAt
+        });
+      }
+    }
+
+    return [...uniqueEntries.values()].slice(0, MAX_RESUME_ENTRIES);
+  }
+
+  async function getResumeEntries() {
+    if (Array.isArray(resumeEntriesCache)) {
+      return resumeEntriesCache;
+    }
+
+    if (!resumeEntriesLoadPromise) {
+      resumeEntriesLoadPromise = storageLocalGet(RESUME_STORAGE_KEY).then((result) => {
+        resumeEntriesCache = normalizeResumeEntries(result[RESUME_STORAGE_KEY]);
+        return resumeEntriesCache;
+      });
+    }
+
+    return resumeEntriesLoadPromise;
+  }
+
+  function updateResumeEntries(mutator) {
+    resumeStorageWriteQueue = resumeStorageWriteQueue
+      .then(async () => {
+        const currentEntries = [...await getResumeEntries()];
+        const nextEntries = normalizeResumeEntries(await mutator(currentEntries));
+        resumeEntriesCache = nextEntries;
+        await storageLocalSet({ [RESUME_STORAGE_KEY]: nextEntries });
+        return nextEntries;
+      })
+      .catch((error) => {
+        console.warn("Kick VOD Seek Fix: resume storage update failed.", error);
+        return resumeEntriesCache || [];
+      });
+
+    return resumeStorageWriteQueue;
+  }
+
+  async function getResumeEntry(vodKey) {
+    const entries = await getResumeEntries();
+    return entries.find((entry) => entry.vodKey === vodKey) || null;
+  }
+
+  function saveResumeEntry(vodKey, resumeTime) {
+    const nextResumeTime = Math.max(0, Math.floor(resumeTime));
+    const updatedAt = Date.now();
+
+    return updateResumeEntries((entries) => [
+      { vodKey, resumeTime: nextResumeTime, updatedAt },
+      ...entries.filter((entry) => entry.vodKey !== vodKey)
+    ]);
+  }
+
+  function removeResumeEntry(vodKey) {
+    return updateResumeEntries((entries) => entries.filter((entry) => entry.vodKey !== vodKey));
   }
 
   function getSeekSlider(video) {
@@ -505,228 +732,6 @@
     }
   }
 
-  function scoreProgressFillCandidate(element, sliderRect, expectedCenterX) {
-    if (!(element instanceof HTMLElement) || element.classList.contains(CUSTOM_HANDLE_CLASS)) {
-      return -1;
-    }
-
-    const rect = element.getBoundingClientRect();
-    if (
-      rect.width <= 0 ||
-      rect.width > sliderRect.width + 24 ||
-      rect.height <= 0 ||
-      rect.height > 18 ||
-      rect.left < sliderRect.left - 24 ||
-      rect.left > sliderRect.left + 24 ||
-      rect.bottom < sliderRect.top - 12 ||
-      rect.top > sliderRect.bottom + 12 ||
-      rect.right < sliderRect.left ||
-      rect.right > sliderRect.right + 24
-    ) {
-      return -1;
-    }
-
-    const style = window.getComputedStyle(element);
-    if (!isGreenishColor(style.backgroundColor)) {
-      return -1;
-    }
-
-    let score = 0;
-    const centerY = rect.top + rect.height / 2;
-    const sliderCenterY = sliderRect.top + sliderRect.height / 2;
-
-    score += Math.max(0, 12 - Math.abs(centerY - sliderCenterY) * 2);
-    score += Math.max(0, 18 - Math.abs(rect.right - expectedCenterX) / 6);
-    score += Math.min(rect.width, sliderRect.width * 0.75) / 12;
-
-    if (style.borderRadius !== "0px") {
-      score += 2;
-    }
-
-    return score;
-  }
-
-  function scoreGreenCapCandidate(element, sliderRect, expectedCenterX) {
-    if (!(element instanceof HTMLElement) || element.classList.contains(CUSTOM_HANDLE_CLASS)) {
-      return -1;
-    }
-
-    const rect = element.getBoundingClientRect();
-    if (
-      rect.width < 6 ||
-      rect.height < 6 ||
-      rect.width > 28 ||
-      rect.height > 28 ||
-      rect.right < sliderRect.left - 18 ||
-      rect.left > sliderRect.right + 18 ||
-      rect.bottom < sliderRect.top - 20 ||
-      rect.top > sliderRect.bottom + 20
-    ) {
-      return -1;
-    }
-
-    const style = window.getComputedStyle(element);
-    if (style.display === "none" || style.visibility === "hidden") {
-      return -1;
-    }
-
-    const isGreen =
-      isGreenishColor(style.backgroundColor) ||
-      isGreenishColor(style.borderColor) ||
-      isGreenishColor(style.boxShadow);
-
-    if (!isGreen) {
-      return -1;
-    }
-
-    let score = 0;
-    const centerX = rect.left + rect.width / 2;
-    const centerY = rect.top + rect.height / 2;
-    const sliderCenterY = sliderRect.top + sliderRect.height / 2;
-    const borderRadiusValue = parseFloat(style.borderRadius);
-
-    if (Math.abs(rect.width - rect.height) <= 8) {
-      score += 5;
-    }
-
-    if (
-      style.borderRadius.includes("%") ||
-      borderRadiusValue >= Math.min(rect.width, rect.height) / 2 - 1
-    ) {
-      score += 6;
-    }
-
-    score += Math.max(0, 10 - Math.abs(centerY - sliderCenterY));
-    score += Math.max(0, 16 - Math.abs(centerX - expectedCenterX) / 3);
-
-    return score;
-  }
-
-  function findProgressFill(slider, progressPercent) {
-    const sliderRect = slider.getBoundingClientRect();
-    const expectedCenterX = sliderRect.left + sliderRect.width * progressPercent;
-    const candidates = getNearbySliderNodes(slider);
-
-    let bestFill = null;
-    let bestScore = -1;
-
-    for (const node of candidates) {
-      const score = scoreProgressFillCandidate(node, sliderRect, expectedCenterX);
-      if (score > bestScore) {
-        bestScore = score;
-        bestFill = node;
-      }
-    }
-
-    return bestScore >= 12 ? bestFill : null;
-  }
-
-  function findGreenCap(slider, progressPercent) {
-    const sliderRect = slider.getBoundingClientRect();
-    const expectedCenterX = sliderRect.left + sliderRect.width * progressPercent;
-    const candidates = getNearbySliderNodes(slider);
-
-    let bestCap = null;
-    let bestScore = -1;
-
-    for (const node of candidates) {
-      const score = scoreGreenCapCandidate(node, sliderRect, expectedCenterX);
-      if (score > bestScore) {
-        bestScore = score;
-        bestCap = node;
-      }
-    }
-
-    return bestScore >= 13 ? bestCap : null;
-  }
-
-  function scoreHandleCandidate(element, sliderRect, expectedCenterX) {
-    if (!(element instanceof HTMLElement) || element.classList.contains(CUSTOM_HANDLE_CLASS)) {
-      return -1;
-    }
-
-    const rect = element.getBoundingClientRect();
-    if (
-      rect.width < 8 ||
-      rect.height < 8 ||
-      rect.width > 32 ||
-      rect.height > 32 ||
-      rect.right < sliderRect.left - 24 ||
-      rect.left > sliderRect.right + 24 ||
-      rect.bottom < sliderRect.top - 24 ||
-      rect.top > sliderRect.bottom + 24
-    ) {
-      return -1;
-    }
-
-    const style = window.getComputedStyle(element);
-    if (style.display === "none" || style.visibility === "hidden") {
-      return -1;
-    }
-
-    let score = 0;
-    const centerX = rect.left + rect.width / 2;
-    const centerY = rect.top + rect.height / 2;
-    const sliderCenterY = sliderRect.top + sliderRect.height / 2;
-    const borderRadiusValue = parseFloat(style.borderRadius);
-
-    if (Math.abs(rect.width - rect.height) <= 6) {
-      score += 5;
-    }
-
-    if (style.borderRadius.includes("%") || borderRadiusValue >= Math.min(rect.width, rect.height) / 2 - 1) {
-      score += 6;
-    }
-
-    if (style.position === "absolute" || style.position === "fixed") {
-      score += 3;
-    }
-
-    score += Math.max(0, 8 - Math.abs(centerY - sliderCenterY));
-    score += Math.max(0, 10 - Math.abs(centerX - expectedCenterX) / 4);
-
-    if (
-      style.backgroundColor !== "rgba(0, 0, 0, 0)" ||
-      style.borderColor !== "rgba(0, 0, 0, 0)" ||
-      style.boxShadow !== "none"
-    ) {
-      score += 2;
-    }
-
-    return score;
-  }
-
-  function findSeekHandle(slider, progressPercent) {
-    const sliderRect = slider.getBoundingClientRect();
-    const expectedCenterX = sliderRect.left + sliderRect.width * progressPercent;
-    const descendants = slider.querySelectorAll("*");
-
-    let bestHandle = null;
-    let bestScore = -1;
-
-    for (const node of descendants) {
-      const score = scoreHandleCandidate(node, sliderRect, expectedCenterX);
-      if (score > bestScore) {
-        bestScore = score;
-        bestHandle = node;
-      }
-    }
-
-    return bestScore >= 10 ? bestHandle : null;
-  }
-
-  function ensureCustomHandle(slider) {
-    let handle = slider.querySelector(`.${CUSTOM_HANDLE_CLASS}`);
-    if (handle instanceof HTMLElement) {
-      return handle;
-    }
-
-    handle = document.createElement("div");
-    handle.className = CUSTOM_HANDLE_CLASS;
-    slider.appendChild(handle);
-    return handle;
-  }
-
   function ensureOverlayParts() {
     let overlay = document.querySelector(`.${CUSTOM_OVERLAY_CLASS}`);
     if (!(overlay instanceof HTMLElement)) {
@@ -757,6 +762,58 @@
     return { overlay, track, fill, handle };
   }
 
+  function ensureResumePromptParts() {
+    let overlay = document.querySelector(`.${RESUME_PROMPT_OVERLAY_CLASS}`);
+    if (!(overlay instanceof HTMLElement)) {
+      overlay = document.createElement("div");
+      overlay.className = RESUME_PROMPT_OVERLAY_CLASS;
+
+      const panel = document.createElement("div");
+      panel.className = RESUME_PROMPT_PANEL_CLASS;
+
+      const title = document.createElement("h2");
+      title.className = RESUME_PROMPT_TITLE_CLASS;
+
+      const text = document.createElement("p");
+      text.className = RESUME_PROMPT_TEXT_CLASS;
+
+      const actions = document.createElement("div");
+      actions.className = RESUME_PROMPT_BUTTON_ROW_CLASS;
+
+      const continueButton = document.createElement("button");
+      continueButton.type = "button";
+      continueButton.className = `${RESUME_PROMPT_BUTTON_CLASS} ${RESUME_PROMPT_PRIMARY_BUTTON_CLASS}`;
+
+      const startButton = document.createElement("button");
+      startButton.type = "button";
+      startButton.className = `${RESUME_PROMPT_BUTTON_CLASS} ${RESUME_PROMPT_SECONDARY_BUTTON_CLASS}`;
+
+      actions.append(continueButton, startButton);
+      panel.append(title, text, actions);
+      overlay.appendChild(panel);
+      document.body.appendChild(overlay);
+    }
+
+    const panel = overlay.querySelector(`.${RESUME_PROMPT_PANEL_CLASS}`);
+    const title = overlay.querySelector(`.${RESUME_PROMPT_TITLE_CLASS}`);
+    const text = overlay.querySelector(`.${RESUME_PROMPT_TEXT_CLASS}`);
+    const buttons = overlay.querySelectorAll(`.${RESUME_PROMPT_BUTTON_CLASS}`);
+    const continueButton = buttons[0];
+    const startButton = buttons[1];
+
+    if (
+      !(panel instanceof HTMLElement) ||
+      !(title instanceof HTMLElement) ||
+      !(text instanceof HTMLElement) ||
+      !(continueButton instanceof HTMLButtonElement) ||
+      !(startButton instanceof HTMLButtonElement)
+    ) {
+      return null;
+    }
+
+    return { overlay, panel, title, text, continueButton, startButton };
+  }
+
   function hideOverlay() {
     const overlay = document.querySelector(`.${CUSTOM_OVERLAY_CLASS}`);
     if (overlay instanceof HTMLElement) {
@@ -764,15 +821,159 @@
     }
   }
 
+  function hideResumePrompt() {
+    resumePromptState = null;
+    const promptParts = ensureResumePromptParts();
+    if (!promptParts) {
+      return;
+    }
+
+    promptParts.overlay.style.display = "none";
+    promptParts.continueButton.onclick = null;
+    promptParts.startButton.onclick = null;
+  }
+
+  function syncResumePromptPosition() {
+    if (!resumePromptState) {
+      return;
+    }
+
+    const promptParts = ensureResumePromptParts();
+    if (!promptParts) {
+      return;
+    }
+
+    const video = getVisibleVideo() || resumePromptState.video;
+    if (!(video instanceof HTMLVideoElement) || !video.isConnected) {
+      hideResumePrompt();
+      return;
+    }
+
+    const rect = video.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      hideResumePrompt();
+      return;
+    }
+
+    promptParts.overlay.style.display = "flex";
+    promptParts.overlay.style.left = `${rect.left}px`;
+    promptParts.overlay.style.top = `${rect.top}px`;
+    promptParts.overlay.style.width = `${rect.width}px`;
+    promptParts.overlay.style.height = `${rect.height}px`;
+  }
+
+  function seekVideoToTime(video, targetTime) {
+    if (!(video instanceof HTMLVideoElement)) {
+      return;
+    }
+
+    const applySeek = () => {
+      const hasDuration = Number.isFinite(video.duration) && video.duration > 0;
+      const safeTime = hasDuration
+        ? clamp(targetTime, 0, Math.max(0, video.duration))
+        : Math.max(0, targetTime);
+
+      if (typeof video.fastSeek === "function") {
+        video.fastSeek(safeTime);
+      } else {
+        video.currentTime = safeTime;
+      }
+
+      scheduleSeekHandleAppearanceSync();
+    };
+
+    if (Number.isFinite(video.duration) && video.duration > 0) {
+      applySeek();
+      return;
+    }
+
+    video.addEventListener("loadedmetadata", applySeek, { once: true });
+  }
+
+  function showResumePrompt(vodKey, video, resumeTime, sessionToken) {
+    ensureHandleStyle();
+
+    const promptParts = ensureResumePromptParts();
+    if (!promptParts) {
+      return;
+    }
+
+    const formattedTime = formatTimecode(resumeTime);
+    const wasPaused = video.paused;
+
+    resumePromptState = {
+      vodKey,
+      video,
+      resumeTime,
+      sessionToken,
+      wasPaused
+    };
+
+    promptParts.title.textContent = "Resume playback?";
+    promptParts.text.textContent = `Continue this VOD from ${formattedTime} or start again from the beginning.`;
+    promptParts.continueButton.textContent = `Continue from ${formattedTime}`;
+    promptParts.startButton.textContent = "Start from beginning";
+
+    if (!wasPaused) {
+      video.pause();
+    }
+
+    promptParts.continueButton.onclick = () => {
+      if (!resumePromptState || resumePromptState.sessionToken !== sessionToken || activeVodKey !== vodKey) {
+        hideResumePrompt();
+        return;
+      }
+
+      const targetVideo = getVisibleVideo() || resumePromptState.video;
+      hideResumePrompt();
+
+      if (targetVideo instanceof HTMLVideoElement) {
+        activeVideo = targetVideo;
+        seekVideoToTime(targetVideo, resumeTime);
+
+        if (!wasPaused) {
+          targetVideo.play().catch(() => {});
+        }
+      }
+
+      void saveResumeEntry(vodKey, resumeTime);
+    };
+
+    promptParts.startButton.onclick = () => {
+      if (!resumePromptState || resumePromptState.sessionToken !== sessionToken || activeVodKey !== vodKey) {
+        hideResumePrompt();
+        return;
+      }
+
+      const targetVideo = getVisibleVideo() || resumePromptState.video;
+      hideResumePrompt();
+
+      if (targetVideo instanceof HTMLVideoElement) {
+        activeVideo = targetVideo;
+        seekVideoToTime(targetVideo, 0);
+
+        if (!wasPaused) {
+          targetVideo.play().catch(() => {});
+        }
+      }
+
+      void removeResumeEntry(vodKey);
+    };
+
+    syncResumePromptPosition();
+  }
+
   function syncSeekHandleAppearance() {
     if (!isKickVodPage()) {
       hideOverlay();
+      hideResumePrompt();
       return;
     }
 
     const video = getVisibleVideo();
     if (!video) {
       hideOverlay();
+      syncResumePromptPosition();
       return;
     }
 
@@ -780,6 +981,7 @@
     const timelineRect = getTimelineRect(video, slider);
     if (!timelineRect) {
       hideOverlay();
+      syncResumePromptPosition();
       return;
     }
 
@@ -787,9 +989,10 @@
 
     const progressPercent = slider instanceof HTMLElement
       ? getSliderProgressPercent(slider, video)
-      : clamp(video.currentTime / video.duration, 0, 1);
+      : clamp(video.currentTime / Math.max(video.duration || 1, 1), 0, 1);
     const overlayParts = ensureOverlayParts();
     if (!overlayParts) {
+      syncResumePromptPosition();
       return;
     }
 
@@ -818,9 +1021,9 @@
     overlayParts.fill.style.width = `${fillWidth}px`;
     overlayParts.handle.style.left = `${handleLeft}px`;
     overlayParts.handle.style.height = `${handleHeight}px`;
-  }
 
-  let seekHandleUpdateQueued = false;
+    syncResumePromptPosition();
+  }
 
   function scheduleSeekHandleAppearanceSync() {
     if (seekHandleUpdateQueued) {
@@ -885,11 +1088,7 @@
       event.stopImmediatePropagation();
       event.stopPropagation();
 
-      if (typeof video.fastSeek === "function") {
-        video.fastSeek(targetTime);
-      } else {
-        video.currentTime = targetTime;
-      }
+      seekVideoToTime(video, targetTime);
 
       // Some player UIs watch bubbling events around the timeline to refresh the scrubber.
       seekBar.dispatchEvent(
@@ -922,8 +1121,91 @@
     video.pause();
   }
 
+  async function persistActiveVodProgress() {
+    if (!activeVodKey || !(activeVideo instanceof HTMLVideoElement)) {
+      return;
+    }
+
+    if (resumePromptState && resumePromptState.vodKey === activeVodKey) {
+      return;
+    }
+
+    const currentTime = Math.max(0, Math.floor(activeVideo.currentTime || 0));
+    await saveResumeEntry(activeVodKey, currentTime);
+  }
+
+  function resetActiveSession(nextVodKey) {
+    activeVodKey = nextVodKey;
+    activeVideo = null;
+    activeSessionInitialized = false;
+    activeSessionToken += 1;
+    hideResumePrompt();
+  }
+
+  async function ensureActiveVodSession() {
+    const currentVodKey = getCurrentVodKey();
+    if (currentVodKey !== activeVodKey) {
+      void persistActiveVodProgress();
+      resetActiveSession(currentVodKey);
+    }
+
+    if (!currentVodKey) {
+      return;
+    }
+
+    const video = getVisibleVideo();
+    if (!(video instanceof HTMLVideoElement)) {
+      return;
+    }
+
+    activeVideo = video;
+
+    if (activeSessionInitialized) {
+      return;
+    }
+
+    activeSessionInitialized = true;
+    const sessionToken = activeSessionToken;
+    const existingEntry = await getResumeEntry(currentVodKey);
+
+    if (sessionToken !== activeSessionToken || currentVodKey !== activeVodKey) {
+      return;
+    }
+
+    if (existingEntry && existingEntry.resumeTime >= MIN_RESUME_PROMPT_SECONDS) {
+      showResumePrompt(currentVodKey, video, existingEntry.resumeTime, sessionToken);
+      return;
+    }
+
+    void saveResumeEntry(currentVodKey, Math.max(0, Math.floor(video.currentTime || 0)));
+  }
+
+  function emitLocationChange() {
+    window.dispatchEvent(new Event(LOCATION_CHANGE_EVENT));
+  }
+
+  function installLocationChangeListeners() {
+    const originalPushState = history.pushState;
+    const originalReplaceState = history.replaceState;
+
+    history.pushState = function (...args) {
+      const result = originalPushState.apply(this, args);
+      emitLocationChange();
+      return result;
+    };
+
+    history.replaceState = function (...args) {
+      const result = originalReplaceState.apply(this, args);
+      emitLocationChange();
+      return result;
+    };
+
+    window.addEventListener("popstate", emitLocationChange);
+  }
+
   const observer = new MutationObserver(() => {
     scheduleSeekHandleAppearanceSync();
+    void ensureActiveVodSession();
   });
 
   observer.observe(document.documentElement, {
@@ -933,10 +1215,39 @@
     attributeFilter: ["aria-valuenow", "aria-valuemin", "aria-valuemax", "style", "class"]
   });
 
+  installLocationChangeListeners();
+
   document.addEventListener("click", seekVideoFromClick, true);
   document.addEventListener("pointermove", scheduleSeekHandleAppearanceSync, true);
   document.addEventListener("timeupdate", scheduleSeekHandleAppearanceSync, true);
   window.addEventListener("resize", scheduleSeekHandleAppearanceSync, { passive: true });
-  window.addEventListener("load", scheduleSeekHandleAppearanceSync, { once: true });
+  window.addEventListener("load", () => {
+    scheduleSeekHandleAppearanceSync();
+    void ensureActiveVodSession();
+  }, { once: true });
+  window.addEventListener(LOCATION_CHANGE_EVENT, () => {
+    void persistActiveVodProgress();
+    resetActiveSession(getCurrentVodKey());
+    scheduleSeekHandleAppearanceSync();
+    void ensureActiveVodSession();
+  });
+  window.addEventListener("pagehide", () => {
+    void persistActiveVodProgress();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      void persistActiveVodProgress();
+    }
+  });
+
+  window.setInterval(() => {
+    void ensureActiveVodSession();
+  }, SESSION_CHECK_INTERVAL_MS);
+
+  window.setInterval(() => {
+    void persistActiveVodProgress();
+  }, RESUME_SAVE_INTERVAL_MS);
+
   scheduleSeekHandleAppearanceSync();
+  void ensureActiveVodSession();
 })();
