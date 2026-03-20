@@ -1,4 +1,4 @@
-# Kick VOD Seek Fix
+# Kick VOD Fix
 
 A small Chrome extension that fixes unreliable click-to-seek behavior on Kick VODs, restores click-to-pause inside the player, remembers where you left off in VODs, and replaces the round seek dot with a vertical green line.
 
